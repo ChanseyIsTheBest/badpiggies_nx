@@ -20,8 +20,8 @@ sdmc:/switch/badpiggies_nx
 ## Controls
 In handheled - touch screen support
 In handeld and docked
-+ brings up the cursor
-- hides the cursor
+"+" brings up the cursor
+"-" hides the cursor
 A taps
 
 ## Requirements (to build)
