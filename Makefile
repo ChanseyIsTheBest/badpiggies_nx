@@ -8,7 +8,7 @@
 # distributes only the original wrapper code.
 #
 # Requires devkitA64 + devkitPro packages:
-#   pacman -S switch-mesa switch-libdrm_nouveau switch-sdl2 switch-zlib
+#   pacman -S switch-mesa switch-libdrm_nouveau switch-sdl2 switch-zlib switch-libpng
 #---------------------------------------------------------------------------------
 .SUFFIXES:
 ifeq ($(strip $(DEVKITPRO)),)
@@ -20,7 +20,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET      := badpiggies_nx
 APP_TITLE   := Bad Piggies
 APP_AUTHOR  := ChanseyIsTheBest
-APP_VERSION := 1.0.0
+APP_VERSION := 1.0.1
 APP_ICON    := $(TOPDIR)/icon.jpg
 export APP_TITLE APP_AUTHOR APP_VERSION APP_ICON
 BUILD    := build
@@ -39,7 +39,7 @@ ASFLAGS  := -g $(ARCH)
 LDFLAGS   = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 # mesa GLES3 + EGL + nouveau (force the GLES path); SDL2 for window/HID/audio; zlib.
-LIBS := -lSDL2 -lGLESv2 -lEGL -lglapi -ldrm_nouveau -lz -lnx -lm
+LIBS := -lSDL2 -lGLESv2 -lEGL -lglapi -ldrm_nouveau -lpng -lz -lnx -lm
 
 LIBDIRS := $(PORTLIBS) $(LIBNX)
 

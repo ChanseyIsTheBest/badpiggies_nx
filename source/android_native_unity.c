@@ -23,6 +23,8 @@
 #include <stddef.h>
 #include <string.h>
 #include <switch.h>
+#include "nx_pointer.h"
+#include "libc_shim.h"   /* GAME_HOME, fopen_fake/fclose_fake (locked file IO) */
 #include "util.h"   /* debugPrintf */
 #include "config.h" /* screen_width / screen_height */
 #include "unity_input_hook.h"
@@ -220,116 +222,72 @@ void android_get_orientation(float *x, float *y, float *z){
 /* HID -> Unity input. The Switch touchscreen passes straight through (all fingers) into
  * il2cpp UnityEngine.Input via the hooks in unity_input_hook.c.
  *
- * On top of that there is an optional VIRTUAL CURSOR (ported from the Laytonbmr port):
- * the left stick moves an on-screen dot, A presses it as a touch. It is drawn by the GL
- * overlay in imports.c, in the SAME bottom-left game-pixel space the touch is injected in,
- * so the dot lands exactly where A taps.
- *
- *   +  (Plus)  -> show the cursor
- *   -  (Minus) -> hide the cursor
- *
- * Default: ON when docked, OFF in handheld -- a docked Switch has no touch panel, so the
- * cursor is the only pointer there; in handheld the finger is better and a dot would just
- * clutter. Pressing +/- once overrides that default for the rest of the session.
- *
- * The cursor tap is fed as just another finger, with a reserved id that cannot collide with
- * a real HID finger_id, so it coexists with real touches and gets a dense fingerId from the
- * slot allocator like everything else. */
+ * On top of that, the reusable nx_pointer module (nx_pointer.{c,h}) provides the on-screen
+ * cursor, USB mouse, gyro pointing and the +/-/stick/A controls, plus its own GL overlay
+ * (drawn from the eglSwapBuffers wrapper in imports.c). We feed it a NxpConfig once, pump
+ * it each frame, and merge its pointer events into the same multi-touch stream the panel
+ * uses -- so a cursor tap is just another finger and rides the same slot allocator. */
 
-#define NX_CURSOR_TOUCH_ID 1000            /* reserved: real HID finger_ids are small (0..15) */
-
-static PadState g_pad;
+static PadState g_pad;                              /* still used for nothing but init parity */
 static HidTouchScreenState g_touch;
-static float g_last_tx = 360, g_last_ty = 640;    /* last touch (game space), reused on release */
-
-static float g_cursor_x = 960.0f, g_cursor_y = 540.0f;  /* game px, bottom-left origin */
-static int   g_cursor_enabled  = 0;
-static int   g_cursor_user_set = 0;               /* has the player pressed +/- yet? */
-
-/* Consumed by the GL overlay in imports.c. Same space the touch is injected in. */
-int   nx_cursor_show = 0;
-float nx_cursor_x = 960.0f, nx_cursor_y = 540.0f;
+static float g_last_tx = 360, g_last_ty = 640;      /* last touch (game space), reused on release */
 
 void android_native_input_init(void){
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
   padInitializeDefault(&g_pad);
   hidInitializeTouchScreen();
+
+  /* nx_pointer owns the pad/touch/mouse/gyro from here on. It reads cursor.png off the SD
+   * card during init, so this must run before the engine spawns its worker threads. The
+   * data_dir is the game folder (GAME_HOME); cursor.png and pointer.cfg live alongside the
+   * save. We hand it the port's LOCKED file wrappers -- newlib's handle table is not
+   * thread-safe and the engine hammers it, so settings I/O must go through fopen_fake/
+   * fclose_fake, not raw fopen. cursor_id sits above any real HID finger_id (0..15). */
+  static const NxpConfig cfg = {
+    .screen_w = 1920, .screen_h = 1080,             /* forced render size (see main.c)      */
+    .panel_w  = 1280, .panel_h  = 720,              /* Switch touch panel space             */
+    .data_dir = GAME_HOME,
+    .cursor_id = 1000,                              /* reserved id: cannot clash with a finger */
+    .max_touch_slots = NX_MAX_TOUCH,
+    .stick_speed = 0.0f,                            /* 0 => module default (14 px/frame)    */
+    .mouse_sens  = 0.0f,
+    .log = NULL,
+    .fopen_fn  = fopen_fake,
+    .fclose_fn = fclose_fake,
+  };
+  nxp_init(&cfg);
 }
 
 void android_native_feed_hid(void){
   padUpdate(&g_pad);
-  const float PANEL_W = 1280.0f, PANEL_H = 720.0f;
+  nxp_update();                                     /* reads pad/touch/mouse/gyro, builds events */
 
-  /* Touchscreen -- ALL fingers, not just the first.
-   *
-   * The Switch touch panel ALWAYS reports in a fixed 1280x720 top-left space, no matter
-   * what resolution we render at. Unity wants game pixels with a BOTTOM-LEFT origin. So we
-   * scale panel -> (screen_width, screen_height) and flip Y. Because both factors are
-   * derived from screen_width/screen_height, this tracks the forced 1920x1080 render
-   * resolution automatically (x1.5 on each axis) -- and would track any other value too.
-   *
-   * Guard the degenerate case: if the resolution has not been resolved yet, fall back to
-   * the panel space 1:1 rather than collapsing every touch onto (0,0). */
+  const float PANEL_W = 1280.0f, PANEL_H = 720.0f;
   const float SW = (screen_width  > 0) ? (float)screen_width  : PANEL_W;
   const float SH = (screen_height > 0) ? (float)screen_height : PANEL_H;
-  const float sx = SW / PANEL_W, sy = SH / PANEL_H;
+
+  /* nx_pointer already reports pointer events in render space with a TOP-LEFT origin and the
+   * pointer-phase values NXP_DOWN/MOVE/UP -- which are numerically the same as the tracker's
+   * (see unity_input_hook.h). Unity wants a BOTTOM-LEFT origin, so we flip Y here and hand the
+   * lot to the same multi-touch tracker the panel feeds. Touchscreen fingers, the stick/gyro/
+   * mouse cursor and USB-mouse taps therefore all arrive through ONE path and share the slot
+   * allocator; nothing has to special-case the cursor. */
+  NxpEvent ev[NX_MAX_TOUCH];
+  int n = nxp_poll(ev, NX_MAX_TOUCH);
 
   NxTouchIn tin[NX_MAX_TOUCH];
   int tn = 0;
-  int n = hidGetTouchScreenStates(&g_touch, 1);
-  if (n > 0 && g_touch.count > 0){
-    for (u32 i = 0; i < g_touch.count && tn < NX_MAX_TOUCH; i++){
-      float px = (float)g_touch.touches[i].x, py = (float)g_touch.touches[i].y;
-      float gx = px * sx;              /* panel px -> game px            */
-      float gy = SH - py * sy;         /* flip Y: top-left -> bottom-left */
-      /* Clamp: a touch right on the panel edge can map a hair outside the render
-       * target, and a game that indexes a grid by pixel does not enjoy that. */
-      if (gx < 0.0f) gx = 0.0f;  if (gx > SW - 1.0f) gx = SW - 1.0f;
-      if (gy < 0.0f) gy = 0.0f;  if (gy > SH - 1.0f) gy = SH - 1.0f;
-      tin[tn].id = (int)g_touch.touches[i].finger_id;   /* raw HID id; densified in the hook */
-      tin[tn].x  = gx;
-      tin[tn].y  = gy;
-      tn++;
-    }
-    g_last_tx = tin[0].x; g_last_ty = tin[0].y;
+  for (int i = 0; i < n && tn < NX_MAX_TOUCH; i++) {
+    float gx = ev[i].x;
+    float gy = SH - ev[i].y;                         /* flip Y: top-left -> bottom-left */
+    if (gx < 0.0f) gx = 0.0f;  if (gx > SW - 1.0f) gx = SW - 1.0f;
+    if (gy < 0.0f) gy = 0.0f;  if (gy > SH - 1.0f) gy = SH - 1.0f;
+    tin[tn].id = ev[i].id;                           /* raw id; densified in the hook   */
+    tin[tn].x  = gx;
+    tin[tn].y  = gy;
+    tn++;
   }
-
-  /* ---- virtual cursor: left stick moves, A taps, +/- shows/hides ---- */
-  const u64 pressed = padGetButtonsDown(&g_pad);       /* edge-triggered: fires once per press */
-  if (pressed & HidNpadButton_Plus) {
-    g_cursor_enabled = 1; g_cursor_user_set = 1;
-    debugPrintf("[input] virtual cursor ON  (+): left stick moves, A taps\n");
-  }
-  if (pressed & HidNpadButton_Minus) {
-    g_cursor_enabled = 0; g_cursor_user_set = 1;
-    debugPrintf("[input] virtual cursor OFF (-)\n");
-  }
-  if (!g_cursor_user_set)                              /* until the player says otherwise */
-    g_cursor_enabled = (appletGetOperationMode() == AppletOperationMode_Console);
-
-  if (g_cursor_enabled) {
-    HidAnalogStickState ls = padGetStickPos(&g_pad, 0);   /* 0 = left stick */
-    const int dx = ls.x, dy = ls.y;
-    if (dx > 3200 || dx < -3200 || dy > 3200 || dy < -3200) {   /* ~10% deadzone kills drift */
-      const float step = 34.0f * (SW / 1920.0f);              /* same feel at any resolution */
-      g_cursor_x += ((float)dx / 32767.0f) * step;
-      g_cursor_y += ((float)dy / 32767.0f) * step;            /* stick up -> +Y (Unity up) */
-      if (g_cursor_x < 0.0f) g_cursor_x = 0.0f; else if (g_cursor_x > SW - 1.0f) g_cursor_x = SW - 1.0f;
-      if (g_cursor_y < 0.0f) g_cursor_y = 0.0f; else if (g_cursor_y > SH - 1.0f) g_cursor_y = SH - 1.0f;
-    }
-    /* A held == finger down at the cursor. Fed as one more finger, so it works alongside a
-     * real touch and picks up Began/Moved/Ended from the same tracker. */
-    if ((padGetButtons(&g_pad) & HidNpadButton_A) && tn < NX_MAX_TOUCH) {
-      tin[tn].id = NX_CURSOR_TOUCH_ID;
-      tin[tn].x  = g_cursor_x;
-      tin[tn].y  = g_cursor_y;
-      tn++;
-      g_last_tx = g_cursor_x; g_last_ty = g_cursor_y;
-    }
-  }
-  nx_cursor_show = g_cursor_enabled;
-  nx_cursor_x    = g_cursor_x;
-  nx_cursor_y    = g_cursor_y;
+  if (tn > 0) { g_last_tx = tin[0].x; g_last_ty = tin[0].y; }
 
   /* tn == 0 -> no fingers down: update_multi emits the Ended frame for any that just lifted. */
   nx_input_hook_update_multi(tin, tn);

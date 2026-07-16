@@ -68,8 +68,7 @@ extern int screen_width;
 extern int screen_height;
 
 typedef struct {
-  int screen_width;    /* <=0 => auto (see main.c) */
-  int screen_height;
+  char language[16];    /* "auto" => follow Switch system language, else ISO code e.g. "fr" */
 } Config;
 
 extern Config config;

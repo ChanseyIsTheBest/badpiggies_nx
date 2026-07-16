@@ -413,10 +413,6 @@ int main(int argc, char *argv[]) {
    * (Touch only exists in handheld -- a docked Switch has no touchscreen at all.) */
   screen_width  = BP_FORCE_SCREEN_W;
   screen_height = BP_FORCE_SCREEN_H;
-  if (config.screen_width > 0 && config.screen_height > 0 &&
-      (config.screen_width != screen_width || config.screen_height != screen_height))
-    debugPrintf("[gfx] config.txt asks for %dx%d -- IGNORED (resolution is forced)\n",
-                config.screen_width, config.screen_height);
   debugPrintf("[gfx] boot mode=%s render=%dx%d (FORCED); touch panel 1280x720 -> scale x%.2f/%.2f\n",
               appletGetOperationMode() == AppletOperationMode_Console ? "DOCKED" : "HANDHELD",
               screen_width, screen_height,

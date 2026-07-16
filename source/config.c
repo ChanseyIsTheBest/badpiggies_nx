@@ -1,5 +1,9 @@
-/* config.c -- Color Sheep config.txt reader/writer.
- * MIT (see LICENSE). Forked from the laytonbmr_nx config loader.
+/* config.c -- Bad Piggies config.txt reader/writer.
+ * MIT (see LICENSE). Forked from the laytonbmr_nx / colorsheep_nx config loader.
+ *
+ * Resolution is FORCED to 1920x1080 in main.c (see config.h BP_FORCE_SCREEN_*), so it is
+ * deliberately NOT a config key -- there is nothing for the user to set. The only key is
+ * `language`.
  */
 #include <stdio.h>
 #include <string.h>
@@ -9,8 +13,7 @@ int screen_width  = 0;
 int screen_height = 0;
 
 Config config = {
-  .screen_width  = -1,   /* auto */
-  .screen_height = -1,
+  .language = "auto",
 };
 
 /* Returns 0 = read clean, -1 = missing, 1 = present but missing/extra keys
@@ -21,26 +24,30 @@ int read_config(const char *file) {
   int seen = 0;
   char line[256];
   while (fgets(line, sizeof line, f)) {
-    char key[64]; int val;
     if (line[0] == '#' || line[0] == '\n') continue;
-    if (sscanf(line, "%63[^=]=%d", key, &val) == 2) {
-      if      (!strcmp(key, "screen_width"))  { config.screen_width = val;  seen |= 1; }
-      else if (!strcmp(key, "screen_height")) { config.screen_height = val; seen |= 2; }
+
+    char sval[64];
+    if (sscanf(line, "language=%63s", sval) == 1) {
+      size_t n = strlen(sval);
+      while (n && (sval[n-1] == '\r' || sval[n-1] == ' ')) sval[--n] = '\0';
+      snprintf(config.language, sizeof config.language, "%s", sval);
+      seen |= 1;
+      continue;
     }
   }
   fclose(f);
-  return (seen == 0x3) ? 0 : 1;
+  return (seen == 0x1) ? 0 : 1;
 }
 
 int write_config(const char *file) {
   FILE *f = fopen(file, "w");
   if (!f) return -1;
   fprintf(f,
-    "# Color Sheep (colorsheep_nx) config\n"
-    "# screen_width/height: render resolution; <=0 = auto.\n"
-    "screen_width=%d\n"
-    "screen_height=%d\n",
-    config.screen_width, config.screen_height);
+    "# Bad Piggies (badpiggies_nx) config\n"
+    "# language: 'auto' follows the Switch system language. Or force one of the seven the\n"
+    "# game supports: en fr de it es ja zh_CN.\n"
+    "language=%s\n",
+    config.language[0] ? config.language : "auto");
   fclose(f);
   return 0;
 }

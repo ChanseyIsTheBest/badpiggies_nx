@@ -36,6 +36,7 @@ extern int z_strncasecmp(const char *, const char *, unsigned long);  /* NULL-sa
 #include <dirent.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include "nx_pointer.h"
 #include <switch.h>
 #include "diag.h"
 
@@ -568,112 +569,11 @@ static EGLBoolean egl_DestroySurface_keep(EGLDisplay d, EGLSurface s) {
 }
 
 
-/* Virtual-cursor overlay (ported from the Laytonbmr port). The game has no pointer sprite,
- * so we draw a small anti-aliased dot (dark ring, white centre) at the cursor right before
- * present, in the SAME bottom-left game-pixel space the touch is injected in -- so the dot
- * sits exactly where A taps. Toggled with +/- ; see android_native_unity.c.
- *
- * This draws into the default framebuffer after the engine is done with the frame, and
- * saves/restores every piece of GL state it touches, so the engine never sees a difference. */
-extern int   nx_cursor_show;   /* android_native_unity.c */
-extern float nx_cursor_x, nx_cursor_y;
-
-static GLuint nx_compile_shader(GLenum type, const char *src) {
-  GLuint s = glCreateShader(type);
-  glShaderSource(s, 1, &src, NULL);
-  glCompileShader(s);
-  return s;
-}
-static GLuint nx_link_program(const char *vs, const char *fs) {
-  GLuint v = nx_compile_shader(GL_VERTEX_SHADER, vs), f = nx_compile_shader(GL_FRAGMENT_SHADER, fs);
-  GLuint p = glCreateProgram();
-  glAttachShader(p, v); glAttachShader(p, f); glLinkProgram(p);
-  glDeleteShader(v); glDeleteShader(f);
-  GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
-  if (!ok) { glDeleteProgram(p); return 0; }
-  return p;
-}
-static struct { GLuint prog; GLint loc_pos, loc_local, loc_feather; int ready; } nx_cur;
-
-static void draw_nx_cursor(void){
-  if (!nx_cursor_show) return;
-  const int W = screen_width  > 0 ? screen_width  : 1920;
-  const int H = screen_height > 0 ? screen_height : 1080;
-  if (!nx_cur.ready) {
-    nx_cur.ready = 1;
-    nx_cur.prog = nx_link_program(
-        "attribute vec2 aPos; attribute vec2 aLocal; varying vec2 vLocal;"
-        "void main() { vLocal = aLocal; gl_Position = vec4(aPos, 0.0, 1.0); }",
-        "precision mediump float; varying vec2 vLocal; uniform float uFeather;"
-        "void main() {"
-        "  float d = length(vLocal);"
-        "  float a = 1.0 - smoothstep(1.0 - uFeather, 1.0, d);"
-        "  float core = 1.0 - smoothstep(0.74 - uFeather, 0.74 + uFeather, d);"
-        "  vec3 col = mix(vec3(0.04), vec3(0.98), core);"   // dark ring, white centre
-        "  gl_FragColor = vec4(col, a * 0.85);"
-        "}");
-    if (nx_cur.prog) {
-      nx_cur.loc_pos     = glGetAttribLocation(nx_cur.prog, "aPos");
-      nx_cur.loc_local   = glGetAttribLocation(nx_cur.prog, "aLocal");
-      nx_cur.loc_feather = glGetUniformLocation(nx_cur.prog, "uFeather");
-    }
-  }
-  if (!nx_cur.prog) return;
-
-  const float r  = 18.0f * ((float)(W > H ? W : H) / 1280.0f);   /* constant on-screen size */
-  const float cx = (nx_cursor_x / (float)W) * 2.0f - 1.0f;
-  const float cy = (nx_cursor_y / (float)H) * 2.0f - 1.0f;       /* bottom-left origin: no Y flip */
-  const float rx = r / (float)W * 2.0f, ry = r / (float)H * 2.0f;
-  const GLfloat pos[8]   = { cx-rx,cy-ry,  cx+rx,cy-ry,  cx-rx,cy+ry,  cx+rx,cy+ry };
-  static const GLfloat local[8] = { -1,-1,  1,-1,  -1,1,  1,1 };
-
-  /* save the engine state this draw touches */
-  GLint prev_prog, prev_buf, prev_vp[4], en_pos = 0, en_local = 0;
-  GLint bsrc_rgb, bdst_rgb, bsrc_a, bdst_a, beq_rgb, beq_a;
-  const GLboolean p_blend = glIsEnabled(GL_BLEND), p_depth = glIsEnabled(GL_DEPTH_TEST);
-  const GLboolean p_scissor = glIsEnabled(GL_SCISSOR_TEST), p_cull = glIsEnabled(GL_CULL_FACE);
-  glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
-  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prev_buf);
-  glGetIntegerv(GL_VIEWPORT, prev_vp);
-  glGetIntegerv(GL_BLEND_SRC_RGB, &bsrc_rgb);     glGetIntegerv(GL_BLEND_DST_RGB, &bdst_rgb);
-  glGetIntegerv(GL_BLEND_SRC_ALPHA, &bsrc_a);     glGetIntegerv(GL_BLEND_DST_ALPHA, &bdst_a);
-  glGetIntegerv(GL_BLEND_EQUATION_RGB, &beq_rgb); glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &beq_a);
-  glGetVertexAttribiv(nx_cur.loc_pos,   GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en_pos);
-  glGetVertexAttribiv(nx_cur.loc_local, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en_local);
-
-  glBindFramebuffer(GL_FRAMEBUFFER, 0);
-  glViewport(0, 0, W, H);
-  glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_CULL_FACE);
-  glEnable(GL_BLEND); glBlendEquation(GL_FUNC_ADD);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-  glBindBuffer(GL_ARRAY_BUFFER, 0);
-  glUseProgram(nx_cur.prog);
-  glUniform1f(nx_cur.loc_feather, 2.5f / r);
-  glEnableVertexAttribArray(nx_cur.loc_pos);
-  glEnableVertexAttribArray(nx_cur.loc_local);
-  glVertexAttribPointer(nx_cur.loc_pos,   2, GL_FLOAT, GL_FALSE, 0, pos);
-  glVertexAttribPointer(nx_cur.loc_local, 2, GL_FLOAT, GL_FALSE, 0, local);
-  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-  /* restore exactly what we changed */
-  if (!en_pos)   glDisableVertexAttribArray(nx_cur.loc_pos);
-  if (!en_local) glDisableVertexAttribArray(nx_cur.loc_local);
-  glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prev_buf);
-  glUseProgram((GLuint)prev_prog);
-  glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
-  glBlendEquationSeparate(beq_rgb, beq_a);
-  glBlendFuncSeparate(bsrc_rgb, bdst_rgb, bsrc_a, bdst_a);
-  if (!p_blend)  glDisable(GL_BLEND);
-  if (p_depth)   glEnable(GL_DEPTH_TEST);
-  if (p_scissor) glEnable(GL_SCISSOR_TEST);
-  if (p_cull)    glEnable(GL_CULL_FACE);
-}
-
 static EGLBoolean egl_SwapBuffers_log(EGLDisplay d, EGLSurface s) {
   /* Re-assert the nwindow transform for the first few frames while mesa settles its swapchain. */
   static unsigned frame = 0;
   if (frame < 5) { frame++; nx_window_reassert(); }
-  draw_nx_cursor();
+  nxp_draw();   /* on-screen cursor overlay; saves/restores all GL state */
   return eglSwapBuffers(d, s);
 }
 

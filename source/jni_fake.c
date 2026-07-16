@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp (config language validation) */
 #include <pthread.h>
 #include <switch.h>
 
@@ -352,31 +353,106 @@ static juint mov_int(const FakeID *id, va_list va) {
 // the APK versionCode, matching the shipped main.10007.android.mvgl.
 #define MAIN_OBB_BASE "main.10007"
 
-/* The game's eLanguage id for the active language (GBR=1 FRN=2 ESP=3 GER=4 ITA=5).
- * language is English-only in this build (see nx_pick_elanguage)
- * Switch system language. This is the single source of truth: the il2cpp
- * LanguageParam.getCurrentLanguage() hook (unity_input_hook.c) returns it so the
- * game loads that language's scenes/text, and lang_code() below mirrors it for the
- * secondary JNI locale queries. Non-static: shared with the hook. */
-/* eLanguage ids (LanguageParam.eLanguage): JPN=0 GBR=1 FRN=2 ESP=3 GER=4 ITA=5. */
-#define EL_GBR 1
-
-/* The active language, as an eLanguage id, for the getCurrentLanguage() hook + JNI locale.
+/* --- Language selection --------------------------------------------------------------
  *
- * IMPORTANT: this APK (com.Level_5.MysteryRoomENG) bundles ENGLISH ASSETS ONLY. Verified from
- * globalgamemanagers' build scene list: 292 scenes under Assets/Scenes/GBR/, and ZERO under
- * FRN/ESP/GER/ITA. The game CODE supports 5 languages (eLanguage enum, getSceneNameByLanguage),
- * but the other-language scene files aren't shipped in this SKU -- which is exactly why the stock
- * getCurrentLanguage() collapses every European locale to GBR. Reporting any other language makes
- * the game build a scene name like "static_resources_FRN" that isn't in the build -> LoadScene
- * fails -> black screen at boot. So we always report English (GBR). config.txt `language` is kept
- * for the plumbing but has no effect here: there is no other language to switch to. */
-int nx_pick_elanguage(void) {
-  return EL_GBR;
+ * Bad Piggies is fully localized. Localizer.DetectLocale() (il2cpp 0x9F2D54) calls
+ * UnityEngine.Application.systemLanguage, and Localizer.LoadLocalizationFile() reads a SINGLE
+ * XML holding every language as text (there are NO per-language scene bundles here -- that was
+ * a different game). This APK's global-metadata.dat carries the full locale table: ar cs da de
+ * el en es fi fr hu id it ja ko nl no pl pt ro ru sv th tr uk vi zh. So all we have to do is
+ * make Application.systemLanguage report the Switch's language, and the game localizes itself.
+ *
+ * How systemLanguage flows on Android (and thus here): native Unity's Application::
+ * GetSystemLanguage calls back through JNI to Locale.getDefault().getLanguage(), then maps the
+ * returned ISO-639-1 code to the UnityEngine.SystemLanguage enum. Our fake JNI answers that
+ * Locale query from lang_code() below -- so lang_code() is the single source of truth, and
+ * pointing it at the Switch's SetLanguage is the entire fix. No il2cpp hook needed.
+ *
+ * config.txt `language`:
+ *   auto (default) -> follow the Switch system language
+ *   a 2-letter code (en, fr, de, ja, zh, ...) -> force that language
+ */
+
+/* SetLanguage (nn::settings) -> the game's own ISO code.
+ *
+ * Bad Piggies ships exactly SEVEN languages (per the store listing): English, French, German,
+ * Italian, Japanese, Simplified Chinese, Spanish. Anything else falls back to English -- the
+ * game does the same. Chinese is Simplified only, so BOTH the Simplified and Traditional Switch
+ * settings map to it (a zh-Hant user gets the one Chinese that exists, not English). We report
+ * it as "zh_CN" so downstream locale formatting is unambiguously Simplified. */
+static const char *nx_setlang_to_iso(u64 sl) {
+  switch (sl) {
+    case SetLanguage_JA:                 return "ja";
+    case SetLanguage_FR:
+    case SetLanguage_FRCA:               return "fr";
+    case SetLanguage_DE:                 return "de";
+    case SetLanguage_IT:                 return "it";
+    case SetLanguage_ES:
+    case SetLanguage_ES419:              return "es";
+    case SetLanguage_ZHCN:
+    case SetLanguage_ZHHANS:
+    case SetLanguage_ZHTW:
+    case SetLanguage_ZHHANT:             return "zh_CN";  /* Simplified only; both settings map here */
+    case SetLanguage_ENUS:
+    case SetLanguage_ENGB:
+    default:                             return "en";     /* English + anything unsupported */
+  }
+}
+
+/* Resolve once: config override if set, else the Switch system language, else English. The
+ * set of ISO codes here is exactly the localization set present in global-metadata.dat; if the
+ * system language isn't among them the game itself falls back to English in DetectLocale. */
+/* The only language codes this build understands (see nx_setlang_to_iso). A config override
+ * outside this set is ignored and we fall back to auto -- better than handing the game a
+ * locale it has no text for. "zh"/"zh_cn"/"zh-cn" all normalize to "zh_CN". */
+static const char *nx_normalize_lang(const char *in) {
+  static const char *ok[] = { "en", "fr", "de", "it", "ja", "es", "zh_CN" };
+  if (!in || !in[0]) return NULL;
+  if (!strcasecmp(in, "zh") || !strcasecmp(in, "zh_cn") || !strcasecmp(in, "zh-cn") ||
+      !strcasecmp(in, "zh_hans") || !strcasecmp(in, "chinese")) return "zh_CN";
+  for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++)
+    if (!strcasecmp(in, ok[i])) return ok[i];
+  return NULL;
+}
+
+static const char *nx_resolve_lang(void) {
+  static const char *cached = NULL;
+  if (cached) return cached;
+
+  extern Config config;                              /* config.h */
+  if (config.language[0] && strcmp(config.language, "auto") != 0) {
+    const char *forced = nx_normalize_lang(config.language);
+    if (forced) {
+      cached = forced;                                /* explicit, supported override */
+      debugPrintf("[lang] forced by config.txt: %s\n", cached);
+      return cached;
+    }
+    debugPrintf("[lang] config.txt language '%s' is not supported -- using auto\n",
+                config.language);                     /* fall through to system language */
+  }
+
+  u64 sl = SetLanguage_ENUS;
+  Result rc = setInitialize();
+  if (R_SUCCEEDED(rc)) {
+    u64 code = 0; SetLanguage lang = SetLanguage_ENUS;
+    if (R_SUCCEEDED(setGetSystemLanguage(&code)) &&
+        R_SUCCEEDED(setMakeLanguage(code, &lang)))
+      sl = (u64)lang;
+    setExit();
+  }
+  cached = nx_setlang_to_iso(sl);
+  debugPrintf("[lang] system language -> %s (auto)\n", cached);
+  return cached;
 }
 
 static const char *lang_code(void) {
-  return "en";                               /* English-only build (see nx_pick_elanguage) */
+  return nx_resolve_lang();
+}
+
+/* Retained for source compatibility with the input-hook plumbing; Bad Piggies does not use
+ * the Layton eLanguage/getCurrentLanguage scheme (its localization is text, not scenes). */
+int nx_pick_elanguage(void) {
+  return 1;
 }
 
 // Walk a JNI arg list per the signature and return the first non-empty String
@@ -489,8 +565,14 @@ static void *act_object(const FakeID *id, va_list va) {
   if (name_has(id->name, "AssetPack3"))       return jni_make_string("CRDBmov");
   if (name_has(id->name, "getProperty"))
     return getproperty_value(jni_string_utf(va_arg(va, void *)));
-  if (name_has(id->name, "Language") || name_has(id->name, "language"))
-    return jni_make_string(lang_code());
+  if (name_has(id->name, "Language") || name_has(id->name, "language")) {
+    /* Locale.getLanguage() returns ONLY the language subtag (e.g. "zh"), never the region.
+     * Unity's Application::GetSystemLanguage maps that bare code to the SystemLanguage enum, so
+     * handing it "zh_CN" here would fail to match and fall back to English. The region ("CN")
+     * belongs to getCountry() / the locale string below, not to getLanguage(). */
+    const char *l = lang_code();
+    return jni_make_string(!strcmp(l, "zh_CN") ? "zh" : l);
+  }
   // Environment.getExternalStorageState() must return the SAME token as the
   // Environment.MEDIA_MOUNTED field ("mounted", see field_object) or the engine
   // decides external storage is unavailable and the save path never initialises.
@@ -504,11 +586,15 @@ static void *act_object(const FakeID *id, va_list va) {
   // the Locale class so we don't hijack toString()/getCountry on other objects.
   if (name_has(id->cls, "Locale")) {
     const char *l = lang_code();
+    /* Country/ISO3/locale strings for each language the game ships (7 total). These feed
+     * secondary locale queries (formatting, getDisplayName); the language itself is `l`. */
     const char *ctry = "US", *iso3l = "eng", *iso3c = "USA", *loc = "en_US";
-    if      (!strcmp(l, "fr")) { ctry = "FR"; iso3l = "fra"; iso3c = "FRA"; loc = "fr_FR"; }
-    else if (!strcmp(l, "es")) { ctry = "ES"; iso3l = "spa"; iso3c = "ESP"; loc = "es_ES"; }
-    else if (!strcmp(l, "de")) { ctry = "DE"; iso3l = "deu"; iso3c = "DEU"; loc = "de_DE"; }
-    else if (!strcmp(l, "it")) { ctry = "IT"; iso3l = "ita"; iso3c = "ITA"; loc = "it_IT"; }
+    if      (!strcmp(l, "fr"))    { ctry = "FR"; iso3l = "fra"; iso3c = "FRA"; loc = "fr_FR"; }
+    else if (!strcmp(l, "es"))    { ctry = "ES"; iso3l = "spa"; iso3c = "ESP"; loc = "es_ES"; }
+    else if (!strcmp(l, "de"))    { ctry = "DE"; iso3l = "deu"; iso3c = "DEU"; loc = "de_DE"; }
+    else if (!strcmp(l, "it"))    { ctry = "IT"; iso3l = "ita"; iso3c = "ITA"; loc = "it_IT"; }
+    else if (!strcmp(l, "ja"))    { ctry = "JP"; iso3l = "jpn"; iso3c = "JPN"; loc = "ja_JP"; }
+    else if (!strcmp(l, "zh_CN")) { ctry = "CN"; iso3l = "zho"; iso3c = "CHN"; loc = "zh_CN"; }
     if (!strcmp(id->name, "getCountry"))     return jni_make_string(ctry);
     if (!strcmp(id->name, "getISO3Language"))return jni_make_string(iso3l);
     if (!strcmp(id->name, "getISO3Country")) return jni_make_string(iso3c);
