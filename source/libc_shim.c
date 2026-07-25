@@ -557,18 +557,41 @@ static int fd_close_by_path(const char *path) {
 // clean unmount. Exiting via HOME kills the process (title override), so that commit never runs
 // and saves written this session vanish on reboot. Track fds opened for writing and commit the
 // card when they close, so a save persists the moment the game finishes writing it.
+/* ---- frame-spike instrumentation -------------------------------------------------------
+ * Cheap counters bumped by the hot shims. main.c times each frame and, when one blows past
+ * the budget, prints the DELTA of these since the previous frame -- so a hitch names its own
+ * cause (an SD commit? an mmap? a GC stop-the-world? a burst of file opens?) instead of us
+ * guessing. Plain ints: single-writer per counter in practice and we only need magnitudes. */
+unsigned nx_stat_open = 0, nx_stat_commit = 0, nx_stat_mmap = 0, nx_stat_gcstop = 0;
+
 #define WFD_MAX 4096
 static unsigned char g_write_fd[WFD_MAX];
 int nx_sd_dirty = 0;   /* a file has been opened for writing since the last commit */
 static void mark_write_fd(int fd)   { nx_sd_dirty = 1; if (fd >= 0 && fd < WFD_MAX) g_write_fd[fd] = 1; }
-static void commit_write_fd(int fd) { if (fd >= 0 && fd < WFD_MAX && g_write_fd[fd]) {
-                                        g_write_fd[fd] = 0; nx_sd_dirty = 0; fsdevCommitDevice("sdmc"); } }
+
+/* Close of a file that was written.
+ *
+ * This used to call fsdevCommitDevice("sdmc") INLINE, on every such close. That is a full SD
+ * filesystem commit -- tens of milliseconds on Switch -- and it ran on the game thread, so any
+ * action that produced a file write stalled the frame. The game writes on interaction (Flurry
+ * analytics appends to FlurryLog.txt, PlayerPrefs -> prefs.kv, progress saves), which is why
+ * discrete TAPS hitched while a sustained hold did not: a hold is one gesture, but each tap
+ * completes an action that writes. A phone never shows this -- there is no fsdevCommitDevice
+ * there; the OS just buffers in the page cache.
+ *
+ * The commit is also redundant. The port already commits from two places: the render loop every
+ * 120 frames (~2s, dirty-gated) and nx_applet_hook on focus-change / exit-request, which covers
+ * quitting via HOME. So we simply leave the dirty flag set and let those do the work -- saves
+ * are still durable within ~2s and guaranteed on exit, without stalling the frame that wrote. */
+static void commit_write_fd(int fd) { if (fd >= 0 && fd < WFD_MAX) g_write_fd[fd] = 0;
+                                      /* nx_sd_dirty stays set: nx_sd_flush() commits it. */ }
 
 /* Commit any pending writes to the physical card. Called periodically from the render loop and
  * after the game's save (nx_save_prefs), so the save survives a HOME-kill / reboot. */
 void nx_sd_flush(void) {
   if (!nx_sd_dirty) return;
   nx_sd_dirty = 0;
+  nx_stat_commit++;
   fsdevCommitDevice("sdmc");
 }
 
@@ -616,6 +639,7 @@ static const char *asset_redirect(const char *path, char *buf, size_t bufsz) {
 }
 
 int open_fake(const char *path, int flags, ...) {
+  nx_stat_open++;
   char _rbuf[512];
   path = casetest_redirect(path);
   path = asset_redirect(path, _rbuf, sizeof _rbuf);
@@ -1407,6 +1431,13 @@ static void *mapcache_get(uint64_t ino, long off, size_t len) {
   mutexUnlock(&g_fb_lock);
   return r;
 }
+static int mapcache_contains(void *ptr) {
+  int r = 0;
+  mutexLock(&g_fb_lock);
+  for (int i = 0; i < g_mapc_n; i++) if (g_mapc[i].ptr == ptr) { r = 1; break; }
+  mutexUnlock(&g_fb_lock);
+  return r;
+}
 static void mapcache_put(uint64_t ino, long off, size_t len, void *ptr) {
   mutexLock(&g_fb_lock);
   for (int i = 0; i < g_fb_n; i++)          // pin: drop from fallback free-list
@@ -1417,8 +1448,39 @@ static void mapcache_put(uint64_t ino, long off, size_t len, void *ptr) {
 }
 
 void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long offset) {
+  nx_stat_mmap++;
   (void)addr;
   if (length == 0) length = 1;
+
+  /* READ-ONLY FILE MAP DEDUP -- checked FIRST, before we allocate or touch the SD card.
+   *
+   * Unity symbolicates native stack frames by re-opening its own libunity.so and mapping the
+   * whole thing, then reading /proc/self/maps for the load address. Something the game does on
+   * a TAP triggers that (a caught exception or a logged event -- it never prints, so it is
+   * invisible without instrumentation). Each occurrence re-read the entire 17 MB file off the
+   * SD card on the game thread: measured at ~244 ms, i.e. a 15-frame stall, on every tap.
+   *
+   * The port already had this dedup, but only on the arena-EXHAUSTED fallback path -- these
+   * maps succeed in the arena, so they never reached it. Hoisting the check here makes the
+   * second and subsequent maps of the same file free, and also stops us leaking a fresh 17 MB
+   * copy each time (29 maps in one short session was ~500 MB of address space).
+   *
+   * Safe because the map is read-only: every caller gets the same immutable bytes. Cached
+   * pointers are pinned -- munmap_fake leaves them alone (see below). */
+  {
+    int ro_file = fd >= 0 && !(flags & BIONIC_MAP_ANONYMOUS) && !(prot & BIONIC_PROT_WRITE);
+    uint64_t mino = (ro_file && fd < FD_INO_MAX) ? g_fd_ino[fd] : 0;
+    if (mino) {
+      void *hit = mapcache_get(mino, offset, length);
+      if (hit) {
+        static unsigned hits = 0;
+        if (++hits <= 3 || (hits % 50) == 0)
+          debugPrintf("[mmap] file map fd=%d len=%zu -> CACHED (no SD read, hit #%u)\n",
+                      fd, length, hits);
+        return hit;
+      }
+    }
+  }
 
   // Big anonymous PROT_NONE reservations -> stack-region OC arena: cheap address
   // space now, physical aliased in on the later mprotect(RW). On a full window we
@@ -1517,11 +1579,19 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
       debugPrintf("[mmap] file map fd=%d len=%zu reserved=%zu fill=%zu got=%ld%s\n",
                   fd, length, reserved, fill, got,
                   ((size_t)got < length) ? "  *** TRUNCATED ***" : "");
+    /* Cache it so a repeat map of the same file is free. Only fully-read read-only maps:
+     * a truncated one must not be handed out again as if it were complete. */
+    if (fd >= 0 && fd < FD_INO_MAX && !(prot & BIONIC_PROT_WRITE) &&
+        (size_t)got >= length && g_fd_ino[fd])
+      mapcache_put(g_fd_ino[fd], offset, length, p);
   }
   return p;
 }
 
 int munmap_fake(void *addr, size_t length) {
+  /* Pinned read-only file map: keep it so the next map of the same file is free. Freeing it
+   * would leave a dangling pointer in the cache and bring the 17 MB SD re-read back. */
+  if (mapcache_contains(addr)) return 0;
   if (mmap_fallback_free(addr)) return 0;   // newlib fallback allocation
   if (oc_contains(addr)) {                   // stack-region OC reservation
     mutexLock(&g_mmap_lock);
@@ -1769,7 +1839,7 @@ int close_fake(int fd) {
   fd_ino_clear(fd);
   if (fakefd_is_fake(fd)) return fakefd_close(fd);
   int r = close(fd);
-  commit_write_fd(fd);   /* flush a just-written save to the physical SD */
+  commit_write_fd(fd);   /* mark the save dirty; nx_sd_flush() commits it (see above) */
   return r;
 }
 int pipe_fake(int fds[2]) { return fakefd_pipe(fds); }
@@ -2017,6 +2087,7 @@ int pthread_kill_gc(pthread_t t, int sig) {
     int restart_sig = *(volatile int *)(b + GC_RESTART_SIG_OFF);
     void **ack_sem  = (void **)(b + GC_ACK_SEM_OFF);
     if (sig == suspend_sig) {            /* stop-the-world: ack the suspend */
+      nx_stat_gcstop++;
       static int logged_s = 0;
       if (!logged_s) { logged_s = 1;
         debugPrintf("[gc] stop-world suspend sig=%d -> acking via sem@il2cpp+0x%x (first time)\n",

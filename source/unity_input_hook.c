@@ -120,20 +120,24 @@ static NxTouch hk_getTouch(int32_t index, void *mi){
 #define IL2CPP_ARRAY_DATA_OFF 0x20
 
 typedef void *(*fn_array_new)(void *klass, uintptr_t length);
+typedef uint32_t (*fn_gchandle_new)(void *obj, int pinned);
 typedef void *(*fn_domain_get)(void);
 typedef void *(*fn_domain_assembly_open)(void *domain, const char *name);
 typedef void *(*fn_assembly_get_image)(void *assembly);
 typedef void *(*fn_class_from_name)(void *image, const char *ns, const char *name);
 
 static fn_array_new            p_array_new;
+static fn_gchandle_new         p_gchandle_new;
 static fn_domain_get           p_domain_get;
 static fn_domain_assembly_open p_domain_assembly_open;
 static fn_assembly_get_image   p_assembly_get_image;
 static fn_class_from_name      p_class_from_name;
 
 void nx_input_hook_bind_il2cpp(void *array_new, void *domain_get, void *domain_assembly_open,
-                               void *assembly_get_image, void *class_from_name) {
+                               void *assembly_get_image, void *class_from_name,
+                               void *gchandle_new) {
   p_array_new            = (fn_array_new)array_new;
+  p_gchandle_new         = (fn_gchandle_new)gchandle_new;
   p_domain_get           = (fn_domain_get)domain_get;
   p_domain_assembly_open = (fn_domain_assembly_open)domain_assembly_open;
   p_assembly_get_image   = (fn_assembly_get_image)assembly_get_image;
@@ -171,6 +175,29 @@ static void touches_resolve(void) {
   debugPrintf("[input] Input.touches: could NOT resolve UnityEngine.Touch -- reporting 0 touches\n");
 }
 
+/* CACHED arrays -- one per possible touch count, allocated at most once each.
+ *
+ * The naive version allocated a fresh managed array on EVERY call, and the game calls
+ * Input.touches a lot while a finger is down: GuiManager.TouchInput and FindTouch, plus the
+ * gesture code (Reporter.isGestureDone x5, getDownPos x3, getDrag x2, isDoubleClickDone x2)
+ * -- 15 call sites, several of them per frame. That is a managed allocation per call through
+ * the public il2cpp_array_new (class-init check + element-size + GC allocate), which on this
+ * port is far more expensive than on Android: with the managed GC disabled the Boehm heap
+ * grows instead of collecting, and every heap expansion goes out through our mmap shim; when
+ * a collection does run, the stop-the-world uses the semaphore bridge in libc_shim.c rather
+ * than real POSIX signals. Either way the cost lands in frames where a finger is down -- which
+ * is exactly the reported symptom (smooth until you touch the screen, fine on the phone).
+ *
+ * So: allocate one array per length 0..NX_MAX_TOUCH, keep each alive with a pinned GC handle,
+ * and just refill its elements in place on each call. Steady state is ZERO allocation.
+ *
+ * Returning the same object to repeated callers is safe here: every call site reads the array
+ * immediately (index it, read position/phase) and none retains it across frames, and each
+ * refill happens before the read. The pin matters because we hold a raw C pointer to a managed
+ * object -- without the handle the collector would be free to reclaim it. */
+static void    *g_touch_arr[NX_MAX_TOUCH + 1];
+static uint32_t g_touch_arr_pin[NX_MAX_TOUCH + 1];
+
 static void *hk_get_touches(void *mi) {
   (void)mi;
   if (g_touches_state == 0) touches_resolve();
@@ -181,15 +208,17 @@ static void *hk_get_touches(void *mi) {
   if (n < 0) n = 0;
   if (n > NX_MAX_TOUCH) n = NX_MAX_TOUCH;
 
-  void *arr = p_array_new(g_touch_klass, (uintptr_t)n);
-  if (!arr) return NULL;
+  void *arr = g_touch_arr[n];
+  if (!arr) {                                     /* first time we see this touch count */
+    arr = p_array_new(g_touch_klass, (uintptr_t)n);
+    if (!arr) return NULL;
+    if (p_gchandle_new) g_touch_arr_pin[n] = p_gchandle_new(arr, 1 /* pinned */);
+    g_touch_arr[n] = arr;
+    debugPrintf("[input] Input.touches: cached array for %d touch(es) (allocated once)\n", n);
+  }
+
   NxTouch *elem = (NxTouch *)((char *)arr + IL2CPP_ARRAY_DATA_OFF);
   for (int i = 0; i < n; i++) fill_touch(&elem[i], &g_hook_touch[i]);
-
-  static int logged = 0;
-  if (!logged && n > 0) { logged = 1;
-    debugPrintf("[input] Input.touches: first array built, %d touch(es), fingerId[0]=%d @(%.0f,%.0f)\n",
-                n, g_hook_touch[0].slot, (double)g_hook_touch[0].x, (double)g_hook_touch[0].y); }
   return arr;
 }
 
@@ -447,3 +476,7 @@ void nx_install_playerprefs_hooks(uintptr_t il2cpp_base, void *string_new) {
 /* True once Input.touches can actually be produced (see touches_resolve). Used by
  * hk_touchCount so we never advertise touches the game would then fail to index. */
 int nx_touches_available(void) { return g_touches_state >= 0; }
+
+/* Live touch count, for the frame-spike reporter in main.c (tells us whether a hitching
+ * frame had a finger down -- the whole question with tap-correlated stutter). */
+int nx_hook_touch_count(void) { return g_hook_count; }

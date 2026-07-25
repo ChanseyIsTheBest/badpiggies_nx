@@ -33,6 +33,7 @@
 #include <SDL2/SDL.h>
 
 #include "config.h"
+#include "libc_shim.h"
 #include "util.h"
 #include "error.h"
 #include "so_util.h"
@@ -593,7 +594,8 @@ int main(int argc, char *argv[]) {
       (void *)so_try_find_addr_rx(&il2cpp_mod, "il2cpp_domain_get"),
       (void *)so_try_find_addr_rx(&il2cpp_mod, "il2cpp_domain_assembly_open"),
       (void *)so_try_find_addr_rx(&il2cpp_mod, "il2cpp_assembly_get_image"),
-      (void *)so_try_find_addr_rx(&il2cpp_mod, "il2cpp_class_from_name"));
+      (void *)so_try_find_addr_rx(&il2cpp_mod, "il2cpp_class_from_name"),
+      (void *)so_try_find_addr_rx(&il2cpp_mod, "il2cpp_gchandle_new"));
 
   nx_install_input_hooks((uintptr_t)il2cpp_mod.load_virtbase);
   nx_install_playerprefs_hooks((uintptr_t)il2cpp_mod.load_virtbase,
@@ -617,7 +619,28 @@ int main(int argc, char *argv[]) {
     g_frame_count++;
     android_native_update_mode();
     android_native_feed_hid();
+
+    /* Time the engine's frame. When one blows the budget, print what happened DURING it --
+     * the per-frame delta of the shim counters -- plus whether a finger was down. A tap that
+     * hitches will show its own cause here (sd=1 -> an SD commit, mmap=N -> heap growth or a
+     * file map, gc=N -> a stop-the-world, open=N -> a burst of file opens). Costs one
+     * clock_gettime pair per frame and prints nothing on a healthy frame. */
+    struct timespec _t0, _t1; clock_gettime(CLOCK_MONOTONIC, &_t0);
+    unsigned _o0 = nx_stat_open, _c0 = nx_stat_commit, _m0 = nx_stat_mmap, _g0 = nx_stat_gcstop;
+
     if (!Unity_nativeRender(fake_env, fake_unityplayer_thiz)) break;
+
+    clock_gettime(CLOCK_MONOTONIC, &_t1);
+    {
+      long _ms = (long)((_t1.tv_sec - _t0.tv_sec) * 1000 + (_t1.tv_nsec - _t0.tv_nsec) / 1000000);
+      if (_ms >= 20) {   /* >20ms = a visibly dropped frame at 60fps */
+        debugPrintf("[perf] frame %d took %ldms  open=%u sd=%u mmap=%u gc=%u  touch=%d\n",
+                    frame, _ms,
+                    nx_stat_open - _o0, nx_stat_commit - _c0,
+                    nx_stat_mmap - _m0, nx_stat_gcstop - _g0,
+                    nx_hook_touch_count());
+      }
+    }
     if (frame < 5 || (frame % 120) == 0) debugPrintf("[boot] frame %d rendered\n", frame);
     frame++;
     if ((frame % 120) == 0) nx_sd_flush();   /* commit any pending save ~every 2s */

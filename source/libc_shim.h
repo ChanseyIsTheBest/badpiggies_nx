@@ -70,6 +70,9 @@ struct bionic_stat;
 int stat_fake(const char *path, struct bionic_stat *st);
 /* POSIX rename(): replaces an existing destination (Horizon's does not). */
 int rename_fake(const char *oldp, const char *newp);
+
+/* frame-spike counters (libc_shim.c); main.c reports their per-frame delta on a hitch */
+extern unsigned nx_stat_open, nx_stat_commit, nx_stat_mmap, nx_stat_gcstop;
 int fstat_fake(int fd, struct bionic_stat *st);
 int lstat_fake(const char *path, struct bionic_stat *st);
 void *readdir_fake(void *dirp);

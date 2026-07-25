@@ -10,10 +10,14 @@
  * so_try_find_addr_rx(&il2cpp_mod, "il2cpp_..."); any may be NULL (the hook then degrades
  * safely to reporting zero touches rather than throwing). */
 void nx_input_hook_bind_il2cpp(void *array_new, void *domain_get, void *domain_assembly_open,
-                               void *assembly_get_image, void *class_from_name);
+                               void *assembly_get_image, void *class_from_name,
+                               void *gchandle_new);
 
 /* Install the hooks. Call once after libil2cpp is loaded+finalized (il2cpp load_virtbase). */
 void nx_install_input_hooks(uintptr_t il2cpp_base);
+
+/* current number of touches being reported to the game (frame-spike diagnostics) */
+int nx_hook_touch_count(void);
 
 /* Route UnityEngine.PlayerPrefs (the game's save) through our persistent prefs.kv store, since
  * Unity's native PlayerPrefs never writes to disk on Switch. string_new = il2cpp_string_new. */
