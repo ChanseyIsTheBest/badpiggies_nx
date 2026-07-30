@@ -69,6 +69,9 @@ extern int screen_height;
 
 typedef struct {
   char language[16];    /* "auto" => follow Switch system language, else ISO code e.g. "fr" */
+  int  cheats;          /* 1 => enable the game's built-in cheat menu (has "Unlock Field of
+                         *      Dreams"). IAP cannot work on this port at all. */
+  int  unlock_field_of_dreams; /* 1 => GetSandboxUnlocked always true (unlocks S-F + all sandboxes) */
 } Config;
 
 extern Config config;

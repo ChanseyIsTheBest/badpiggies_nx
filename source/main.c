@@ -34,6 +34,7 @@
 
 #include "config.h"
 #include "libc_shim.h"
+#include "bp_unlocks.h"
 #include "util.h"
 #include "error.h"
 #include "so_util.h"
@@ -445,6 +446,9 @@ int main(int argc, char *argv[]) {
     if (swept) debugPrintf("[boot] swept %d case-sensitivity probe file(s)\n", swept);
   }
 
+  debugPrintf("[boot] ===== badpiggies_nx build %s %s =====\n", __DATE__, __TIME__);
+  debugPrintf("[boot] fixes: ftt-stub gc-offsets asset-redirect touch-hooks 1080p rename-posix "
+              "map-dedup fd-cache(.so-only) synth-proc-cache\n");
   debugPrintf("[boot] loading modules...\n");
   if (load_module(&main_mod,   LIB_MAIN)   < 0) fatal_error("Could not load %s", LIB_MAIN);
   if (load_module(&unity_mod,  LIB_UNITY)  < 0) fatal_error("Could not load %s", LIB_UNITY);
@@ -589,6 +593,8 @@ int main(int argc, char *argv[]) {
    * All RVAs were confirmed to land on real function prologues in this libil2cpp.so. */
   /* Input.touches needs to allocate a managed UnityEngine.Touch[], so hand the hook the
    * exported il2cpp runtime API it needs. Must precede nx_install_input_hooks. */
+  bp_install_unlocks((uintptr_t)il2cpp_mod.load_virtbase);
+
   nx_input_hook_bind_il2cpp(
       (void *)so_try_find_addr_rx(&il2cpp_mod, "il2cpp_array_new"),
       (void *)so_try_find_addr_rx(&il2cpp_mod, "il2cpp_domain_get"),

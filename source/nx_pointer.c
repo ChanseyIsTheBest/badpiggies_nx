@@ -45,6 +45,11 @@ static int   s_was_docked = -1;
 static int   s_tap_prev  = 0;       /* A or mouse-left held last frame */
 
 /* tunables, adjusted live */
+/* Cursor travel multiplier while a tap is held (see the drag-boost comment further down).
+ * 1.0 = no boost (a drag moves at pointing speed). Raise for flickier swipes, lower for finer
+ * dragging. Applies to the virtual cursor only -- never to the physical touchscreen. */
+#define NXP_DRAG_BOOST 2.5f
+
 static float s_stick_speed;         /* px/frame at full stick deflection */
 static float s_mouse_sens;          /* multiplier on mouse deltas */
 static float s_gyro_sens;           /* multiplier on gyro angular velocity */
@@ -651,8 +656,18 @@ void nxp_update(void) {
   if (s_visible > 0) {
     HidAnalogStickState ls = padGetStickPos(&s_pad, 0);
     if (ls.x || ls.y) {
-      s_cx += (ls.x / 32767.0f) * s_stick_speed;
-      s_cy -= (ls.y / 32767.0f) * s_stick_speed;   /* stick +y is up */
+      /* DRAG BOOST. While a tap is held the cursor is dragging, not pointing, so it needs to
+       * cover ground: games recognise a swipe/flick by how far the contact travels per frame,
+       * and the pointing speed (14 px/frame ~ 840 px/s) is too slow to clear that bar on a
+       * 1920-wide screen -- the drag reads as a slow press instead of a swipe. Boosting only
+       * while held keeps pointing precise for aiming and part placement.
+       *
+       * This affects the VIRTUAL CURSOR only. The physical touchscreen is fed straight through
+       * in do_touch() at true panel coordinates and is deliberately untouched -- a finger
+       * already swipes exactly as it does on a phone. */
+      const float sp = s_stick_speed * (s_tap_prev ? NXP_DRAG_BOOST : 1.0f);
+      s_cx += (ls.x / 32767.0f) * sp;
+      s_cy -= (ls.y / 32767.0f) * sp;   /* stick +y is up */
       clamp_cursor();
     }
 

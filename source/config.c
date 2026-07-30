@@ -13,7 +13,9 @@ int screen_width  = 0;
 int screen_height = 0;
 
 Config config = {
-  .language = "auto",
+  .language       = "auto",
+  .cheats         = 0,
+  .unlock_field_of_dreams = 0,
 };
 
 /* Returns 0 = read clean, -1 = missing, 1 = present but missing/extra keys
@@ -26,6 +28,10 @@ int read_config(const char *file) {
   while (fgets(line, sizeof line, f)) {
     if (line[0] == '#' || line[0] == '\n') continue;
 
+    int ival;
+    if (sscanf(line, "cheats=%d", &ival) == 1)         { config.cheats = ival;         seen |= 2; continue; }
+    if (sscanf(line, "unlock_field_of_dreams=%d", &ival) == 1) { config.unlock_field_of_dreams = ival; seen |= 8; continue; }
+
     char sval[64];
     if (sscanf(line, "language=%63s", sval) == 1) {
       size_t n = strlen(sval);
@@ -36,7 +42,7 @@ int read_config(const char *file) {
     }
   }
   fclose(f);
-  return (seen == 0x1) ? 0 : 1;
+  return (seen == 0xB) ? 0 : 1;
 }
 
 int write_config(const char *file) {
@@ -44,10 +50,25 @@ int write_config(const char *file) {
   if (!f) return -1;
   fprintf(f,
     "# Bad Piggies (badpiggies_nx) config\n"
+    "\n"
     "# language: 'auto' follows the Switch system language. Or force one of the seven the\n"
     "# game supports: en fr de it es ja zh_CN.\n"
-    "language=%s\n",
-    config.language[0] ? config.language : "auto");
+    "language=%s\n"
+    "\n"
+    "# unlock_field_of_dreams: 1 unlocks the Field of Dreams sandbox (id \"S-F\").\n"
+    "#   Same effect as the well-known SetSandboxUnlocked(\"S-F\", true) edit: that flips a\n"
+    "#   flag which GameProgress.GetSandboxUnlocked() reads, and this patches that getter.\n"
+    "#   NOTE: currently unlocks ALL sandbox levels, not only Field of Dreams.\n"
+    "unlock_field_of_dreams=%d\n"
+
+    "\n"
+    "# cheats: 1 flips the game's built-in developer cheat flag.\n"
+    "#   *** KNOWN BROKEN: the flag is set, but the cheat menu cannot be opened -- its\n"
+    "#   entry does not respond in this build's UI. Left in for completeness only.\n"
+    "#   Use unlock_field_of_dreams instead. ***\n"
+    "cheats=%d\n",
+    config.language[0] ? config.language : "auto",
+    config.unlock_field_of_dreams, config.cheats);
   fclose(f);
   return 0;
 }

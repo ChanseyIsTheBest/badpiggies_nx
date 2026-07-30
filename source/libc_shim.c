@@ -509,8 +509,31 @@ static int synth_proc_open(const char *path) {
   safe[j] = '\0';
   char tf[256];
   snprintf(tf, sizeof tf, "%s/.synth%s", GAME_HOME, safe);
-  int wfd = open(tf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (wfd >= 0) { if (write(wfd, buf, (size_t)len) < 0) { /* best effort */ } close(wfd); }
+
+  /* Only rewrite the backing file when the content actually changed.
+   *
+   * This used to create + write + close + reopen on EVERY call -- four SD operations. Unity
+   * re-reads /proc/self/maps each time it symbolicates a native stack, which this game does on
+   * every tap, so that was ~33 ms of SD traffic per tap even after the .so map and open caches
+   * removed everything else. The module list does not change after boot, so the content is
+   * identical every time: hash it, and skip the write when it matches. Only the final read-only
+   * open remains, and that is cheap. */
+  {
+    static uint64_t last_hash[8];
+    static int      last_slot = 0, nslots = 0;
+    uint64_t h = 1469598103934665603ULL;             /* FNV-1a over path + content */
+    for (const char *p = tf; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+    for (int i = 0; i < len; i++)     { h ^= (unsigned char)buf[i]; h *= 1099511628211ULL; }
+    int fresh = 0;
+    for (int i = 0; i < nslots; i++) if (last_hash[i] == h) { fresh = 1; break; }
+    if (!fresh) {
+      int wfd = open(tf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (wfd >= 0) { if (write(wfd, buf, (size_t)len) < 0) { /* best effort */ } close(wfd); }
+      if (nslots < 8) last_hash[nslots++] = h;
+      else { last_hash[last_slot] = h; last_slot = (last_slot + 1) % 8; }
+      debugPrintf("[io] synth %s regenerated (%d bytes)\n", path, len);
+    }
+  }
   return open(tf, O_RDONLY);
 }
 
@@ -541,11 +564,13 @@ static void fd_ino_clear(int fd) { if (fd >= 0 && fd < FD_INO_MAX) g_fd_ino[fd] 
  * g_fd_ino is a 64-bit FNV hash of the path, maintained by open_fake/close_fake, so a false
  * match would need a 64-bit hash collision against a path opened in this same process. */
 int close_fake(int fd);          /* fwd: clears g_fd_ino and commits the SD card */
+static int ofdcache_held(int fd);/* fwd: descriptors held open by the OPEN-FD CACHE */
 static int fd_close_by_path(const char *path) {
   const uint64_t ino = path_ino(path);
   int first = -1;
   for (int fd = 0; fd < FD_INO_MAX; fd++) {
     if (g_fd_ino[fd] != ino) continue;
+    if (ofdcache_held(fd)) continue;      /* never close a deliberately-held handle */
     debugPrintf("[io] rename: closing caller's open handle fd=%d on %s\n", fd, path);
     close_fake(fd);
     if (first < 0) first = fd;
@@ -583,8 +608,22 @@ static void mark_write_fd(int fd)   { nx_sd_dirty = 1; if (fd >= 0 && fd < WFD_M
  * 120 frames (~2s, dirty-gated) and nx_applet_hook on focus-change / exit-request, which covers
  * quitting via HOME. So we simply leave the dirty flag set and let those do the work -- saves
  * are still durable within ~2s and guaranteed on exit, without stalling the frame that wrote. */
-static void commit_write_fd(int fd) { if (fd >= 0 && fd < WFD_MAX) g_write_fd[fd] = 0;
-                                      /* nx_sd_dirty stays set: nx_sd_flush() commits it. */ }
+static void commit_write_fd(int fd) {
+  if (fd < 0 || fd >= WFD_MAX || !g_write_fd[fd]) return;
+  g_write_fd[fd] = 0;
+  /* Commit the write to the physical card here, at close.
+   *
+   * I removed this earlier on the theory that it caused the tap stutter, and deferred it to the
+   * periodic nx_sd_flush(). That theory was wrong -- the stutter was Unity re-reading its own
+   * .so to symbolicate -- and deferring cost real durability: libnx buffers sdmc: writes, so
+   * without a commit the save exists only in RAM. Combined with the rename jam, progress did not
+   * survive a reload. Saves are rare (end of a level, settings change) and the tap path never
+   * writes, so paying the commit here costs nothing during play and makes a save durable the
+   * moment the game finishes writing it. nx_sd_flush() stays as the periodic safety net. */
+  nx_sd_dirty = 0;
+  nx_stat_commit++;
+  fsdevCommitDevice("sdmc");
+}
 
 /* Commit any pending writes to the physical card. Called periodically from the render loop and
  * after the game's save (nx_save_prefs), so the save survives a HOME-kill / reboot. */
@@ -617,7 +656,7 @@ static const char *casetest_redirect(const char *path) {
  * asset root). On Switch a leading "/" makes newlib resolve against the DEFAULT
  * DEVICE ROOT, i.e. sdmc:/assets/... -- the root of the SD card -- which does not
  * exist. Our assets live under GAME_HOME/assets/. Result: every absolute asset
- * open returned -1 (AssetBundles/*.unity3d, Data/*.json) even though the files
+ * open returned -1 (the .unity3d bundles and the Data json files) even though they
  * were present, because they were being looked for in the wrong place.
  *
  * Relative "assets/..." paths already work (they resolve against the cwd, which
@@ -636,6 +675,104 @@ static const char *asset_redirect(const char *path, char *buf, size_t bufsz) {
     return buf;
   }
   return path;
+}
+
+/* ---- OPEN-FD CACHE for repeatedly re-opened read-only files ---------------------------
+ *
+ * With the map dedup in place, Unity's symbolication no longer re-READS libunity.so /
+ * libil2cpp.so -- but it still re-OPENS them (plus /proc/self/maps) on every tap, and an open
+ * on Horizon is a FAT directory lookup plus a metadata read. Measured at ~40 ms for the three,
+ * spiking past 400 ms when the card is slow. Since the mapping now comes from cache, the caller
+ * never reads a byte from these fds: it opens, mmaps, closes.
+ *
+ * So keep one real handle per such file and hand out dup()s of it. dup() is a table entry, no
+ * directory traversal. Same admission rule as the map cache -- only on the SECOND read-only
+ * open of a path, so one-shot boot opens neither consume a slot nor stay open forever.
+ *
+ * The shared handle's file position is not a hazard here: mmap_fake saves and restores the
+ * offset around its reads, and dup()ed descriptors are closed normally by the caller. If dup()
+ * ever fails we simply fall through to a real open, so this can only ever be a speed-up. */
+/* Two separate tables, for the same reason the map cache needed them: a small fixed array that
+ * every one-shot BOOT open can fill is useless, because the file we actually care about is only
+ * opened repeatedly LATER. Boot opens dozens of read-only files (assets, resources, metadata);
+ * with a single 8-entry table they took every slot and libunity.so was never even recorded, so
+ * the cache never engaged once (zero hits across two test builds).
+ *   g_ofdc_seen : first-sighting ring, overwrite-oldest, cheap and disposable
+ *   g_ofdc      : descriptors we are actually holding open -- never evicted */
+#define OFDS_N 64
+#define OFDC_N 8
+static Mutex g_ofdc_lock;   /* own lock: g_fb_lock is declared further down the file */
+static uint64_t g_ofdc_seen[OFDS_N];
+static int g_ofdc_seen_n = 0, g_ofdc_seen_w = 0;
+static struct { uint64_t ino; int fd; } g_ofdc[OFDC_N];
+static int g_ofdc_n = 0;
+
+/* 1 if we have seen this path opened read-only before; records it otherwise. */
+static int ofdc_seen_check(uint64_t ino) {
+  for (int i = 0; i < g_ofdc_seen_n; i++) if (g_ofdc_seen[i] == ino) return 1;
+  if (g_ofdc_seen_n < OFDS_N) g_ofdc_seen[g_ofdc_seen_n++] = ino;
+  else { g_ofdc_seen[g_ofdc_seen_w] = ino; g_ofdc_seen_w = (g_ofdc_seen_w + 1) % OFDS_N; }
+  return 0;
+}
+
+/* Returns a cached handle for `path`, or -1. Records first sightings.
+ *
+ * NOTE: an earlier version handed out dup()s of the held handle. dup() does not work on
+ * devkitPro/fsdev file descriptors -- it fails, so the adopt step below silently never fired
+ * and the cache never engaged (zero hits in the log). We therefore hand back the SAME fd and
+ * make close_fake() refuse to close a held one. Safe here because these files are opened
+ * read-only and only to be mmap'd: the caller opens, maps (served from the map cache), and
+ * closes. mmap_fake saves and restores the file offset around its reads, so a shared position
+ * is not a hazard. */
+/* ONLY shared libraries are ever held open.
+ *
+ * The cache exists for one thing: Unity re-opening libunity.so / libil2cpp.so to symbolicate a
+ * native stack on every tap. An earlier version adopted any repeatedly-opened read-only file,
+ * which quietly latched onto SAVE files -- Progress.dat.bak, Settings.xml.bak, fusion.registry.
+ * Horizon cannot rename or delete a file that has a live handle, so holding .bak open jammed the
+ * atomic save chain (write .tmp -> rename dat->bak -> rename tmp->dat) permanently. Sandbox
+ * progress stopped persisting as a result. Restricting adoption to ".so" keeps every benefit and
+ * cannot touch anything the game writes. */
+static int ofdc_path_eligible(const char *path) {
+  size_t n = path ? strlen(path) : 0;
+  return n > 3 && !strcmp(path + n - 3, ".so");
+}
+
+static int ofdcache_open(const char *path) {
+  if (!ofdc_path_eligible(path)) return -1;
+  const uint64_t ino = path_ino(path);
+  int out = -1;
+  mutexLock(&g_ofdc_lock);
+  for (int i = 0; i < g_ofdc_n; i++)
+    if (g_ofdc[i].ino == ino && g_ofdc[i].fd >= 0) { out = g_ofdc[i].fd; break; }
+  mutexUnlock(&g_ofdc_lock);
+  return out;
+}
+
+/* After a successful real read-only open: hold the handle if we have seen this path before and
+ * there is a free slot. */
+static void ofdcache_adopt(const char *path, int fd) {
+  if (!ofdc_path_eligible(path)) return;
+  const uint64_t ino = path_ino(path);
+  mutexLock(&g_ofdc_lock);
+  for (int i = 0; i < g_ofdc_n; i++)
+    if (g_ofdc[i].ino == ino) { mutexUnlock(&g_ofdc_lock); return; }   /* already held */
+  if (ofdc_seen_check(ino) && g_ofdc_n < OFDC_N) {
+    g_ofdc[g_ofdc_n].ino = ino; g_ofdc[g_ofdc_n].fd = fd; g_ofdc_n++;
+    mutexUnlock(&g_ofdc_lock);
+    debugPrintf("[io] fd-cache: holding %s open (repeat opens now free)\n", path);
+    return;
+  }
+  mutexUnlock(&g_ofdc_lock);
+}
+
+/* Is this descriptor one we are deliberately holding open? close_fake() must not close it. */
+static int ofdcache_held(int fd) {
+  int r = 0;
+  mutexLock(&g_ofdc_lock);
+  for (int i = 0; i < g_ofdc_n; i++) if (g_ofdc[i].fd == fd) { r = 1; break; }
+  mutexUnlock(&g_ofdc_lock);
+  return r;
 }
 
 int open_fake(const char *path, int flags, ...) {
@@ -669,6 +806,19 @@ int open_fake(const char *path, int flags, ...) {
     int sfd = synth_proc_open(path);
     if (sfd >= 0) { fd_ino_set(sfd, path); debugPrintf("[io] open(%s,0x%x) -> %d [synthetic]\n", path, flags, sfd); return sfd; }
   }
+  /* Repeat read-only open of a file we are already holding: hand back a dup and skip the
+   * directory lookup entirely (see OPEN-FD CACHE above). */
+  if (!writing) {
+    int cfd = ofdcache_open(path);
+    if (cfd >= 0) {
+      fd_ino_set(cfd, path);
+      static unsigned ohits = 0;
+      if (++ohits <= 3 || (ohits % 50) == 0)
+        debugPrintf("[io] open(%s) -> %d [fd-cache, no SD lookup, hit #%u]\n", path, cfd, ohits);
+      return cfd;
+    }
+  }
+
   int fd = open(path, cvt, mode);
   if (fd < 0 && writing) {
     // save files: the target subdir may not exist yet -- create it and retry
@@ -681,6 +831,7 @@ int open_fake(const char *path, int flags, ...) {
       fd = open(alt, cvt, mode);
   }
   if (fd >= 0) {
+    if (!writing) ofdcache_adopt(path, fd);   /* may hold this handle open for reuse */
     fd_ino_set(fd, path);
     if (writing) mark_write_fd(fd);
     struct stat _st;
@@ -1420,7 +1571,40 @@ static int mmap_fallback_free(void *addr) {
 // play session that is dozens of fresh copies (~1.4GB) that exhaust newlib ->
 // the "arena FULL / out of RAM" self-exit. Dedup: hand back one shared, pinned
 // buffer per (file inode, offset, length). Safe -- these maps are read-only.
-#define MAPC_N 24
+#define MAPC_N 48
+/* Admission: a file is cached only on its SECOND map.
+ *
+ * The cache is finite and mapcache_put() silently no-ops when full. Admitting every read-only
+ * file map let ~20 one-shot BOOT maps (global-metadata.dat, data.unity3d, sharedassets*, ...)
+ * race for the slots, so whether libunity.so still found one by the time you tapped depended on
+ * what that boot happened to load first -- which is why the stall came back on roughly half the
+ * boots. One-shot maps also must not be pinned: pinning makes them permanent and raises peak
+ * memory for no benefit, since nothing ever maps them again.
+ *
+ * So we keep a tiny signature ring of files we have mapped once. Only when the SAME
+ * (file, offset, length) is mapped a second time does it earn a cache slot -- which is exactly
+ * the repeat-mapping behaviour (libunity.so symbolication) worth paying for. */
+#define MAPS_N 64
+static struct { uint64_t ino; long off; size_t len; } g_maps_seen[MAPS_N];
+static int g_maps_seen_n = 0;
+
+/* Returns 1 if this signature has been mapped before (=> admit to the cache). Records it
+ * otherwise. Ring-overwrites oldest; a lost record only costs one extra map. */
+static int mapseen_check_and_record(uint64_t ino, long off, size_t len) {
+  int seen = 0;
+  mutexLock(&g_fb_lock);
+  for (int i = 0; i < g_maps_seen_n; i++)
+    if (g_maps_seen[i].ino == ino && g_maps_seen[i].off == off && g_maps_seen[i].len == len) {
+      seen = 1; break;
+    }
+  if (!seen) {
+    int slot = (g_maps_seen_n < MAPS_N) ? g_maps_seen_n++ : (rand() % MAPS_N);
+    g_maps_seen[slot].ino = ino; g_maps_seen[slot].off = off; g_maps_seen[slot].len = len;
+  }
+  mutexUnlock(&g_fb_lock);
+  return seen;
+}
+
 static struct { uint64_t ino; long off; size_t len; void *ptr; } g_mapc[MAPC_N];
 static int g_mapc_n = 0;
 static void *mapcache_get(uint64_t ino, long off, size_t len) {
@@ -1442,6 +1626,12 @@ static void mapcache_put(uint64_t ino, long off, size_t len, void *ptr) {
   mutexLock(&g_fb_lock);
   for (int i = 0; i < g_fb_n; i++)          // pin: drop from fallback free-list
     if (g_fb[i].ptr == ptr) { g_fb_bytes -= g_fb[i].len; g_fb[i] = g_fb[--g_fb_n]; break; }
+  if (g_mapc_n >= MAPC_N) {
+    static int warned = 0;
+    if (!warned) { warned = 1;
+      debugPrintf("[mmap] WARNING: map cache full (%d entries) -- repeat maps will re-read from SD\n",
+                  MAPC_N); }
+  }
   if (g_mapc_n < MAPC_N) { g_mapc[g_mapc_n].ino = ino; g_mapc[g_mapc_n].off = off;
                            g_mapc[g_mapc_n].len = len; g_mapc[g_mapc_n].ptr = ptr; g_mapc_n++; }
   mutexUnlock(&g_fb_lock);
@@ -1467,11 +1657,13 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
    *
    * Safe because the map is read-only: every caller gets the same immutable bytes. Cached
    * pointers are pinned -- munmap_fake leaves them alone (see below). */
+  uint64_t mc_ino = 0;   /* non-zero => this is a read-only file map we can dedup */
+  int      mc_admit = 0; /* 1 => we have mapped this exact file before: cache it this time */
   {
     int ro_file = fd >= 0 && !(flags & BIONIC_MAP_ANONYMOUS) && !(prot & BIONIC_PROT_WRITE);
-    uint64_t mino = (ro_file && fd < FD_INO_MAX) ? g_fd_ino[fd] : 0;
-    if (mino) {
-      void *hit = mapcache_get(mino, offset, length);
+    mc_ino = (ro_file && fd < FD_INO_MAX) ? g_fd_ino[fd] : 0;
+    if (mc_ino) {
+      void *hit = mapcache_get(mc_ino, offset, length);
       if (hit) {
         static unsigned hits = 0;
         if (++hits <= 3 || (hits % 50) == 0)
@@ -1479,6 +1671,7 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
                       fd, length, hits);
         return hit;
       }
+      mc_admit = mapseen_check_and_record(mc_ino, offset, length);
     }
   }
 
@@ -1528,11 +1721,8 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
     // and rejecting them is what NULL-derefs the engine. Only a genuinely huge map
     // (> newlib free) will fail, and we log that distinctly.
     // Read-only file maps get deduped (backtrace .so symbolication leak, see above).
-    int ro_file = fd >= 0 && !(flags & BIONIC_MAP_ANONYMOUS) && !(prot & BIONIC_PROT_WRITE);
-    uint64_t mino = (ro_file && fd < FD_INO_MAX) ? g_fd_ino[fd] : 0;
-    if (mino) { void *hit = mapcache_get(mino, offset, length); if (hit) return hit; }
     void *q = mmap_fallback(length, flags, fd, offset);
-    if (q) { if (mino) mapcache_put(mino, offset, length, q); return q; }
+    if (q) { if (mc_ino && mc_admit) mapcache_put(mc_ino, offset, length, q); return q; }
     debugPrintf("[mmap] arena FULL and newlib fallback FAILED for %u MB (out of RAM)\n",
                 (unsigned)(length >> 20));
     errno = ENOMEM; return (void *)-1;
@@ -1581,9 +1771,8 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
                   ((size_t)got < length) ? "  *** TRUNCATED ***" : "");
     /* Cache it so a repeat map of the same file is free. Only fully-read read-only maps:
      * a truncated one must not be handed out again as if it were complete. */
-    if (fd >= 0 && fd < FD_INO_MAX && !(prot & BIONIC_PROT_WRITE) &&
-        (size_t)got >= length && g_fd_ino[fd])
-      mapcache_put(g_fd_ino[fd], offset, length, p);
+    if (mc_ino && mc_admit && (size_t)got >= length)
+      mapcache_put(mc_ino, offset, length, p);
   }
   return p;
 }
@@ -1835,6 +2024,9 @@ long write_fake(int fd, const void *buf, size_t count) {
   return write(fd, buf, count);
 }
 int close_fake(int fd) {
+  /* Descriptor we are deliberately holding open for reuse (see OPEN-FD CACHE): swallow the
+   * close. Keep g_fd_ino intact -- the mapping cache keys off it on the next open. */
+  if (ofdcache_held(fd)) return 0;
   ra_detach(fd);
   fd_ino_clear(fd);
   if (fakefd_is_fake(fd)) return fakefd_close(fd);
