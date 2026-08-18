@@ -42,7 +42,6 @@ On first launch the wrapper writes `sdmc:/switch/angrybirds/config.txt`
 ```
 # language: 'auto' follows the Switch system language, or one of the codes in
 # the table below (e.g. fr, de, es, ja, zh_CN).
-# Simplified Chinese is missing some text rendering for game elements. 
 ```
 
 | `language=` | Game locale | UI text |
