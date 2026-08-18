@@ -67,6 +67,7 @@ int mkdir_fake(const char *path, unsigned mode);
 int openat_fake(int dirfd, const char *path, int flags, ...);
 int unlinkat_fake(int dirfd, const char *path, int flags);
 struct bionic_stat;
+void *opendir_fake(const char *path);
 int stat_fake(const char *path, struct bionic_stat *st);
 /* POSIX rename(): replaces an existing destination (Horizon's does not). */
 int rename_fake(const char *oldp, const char *newp);

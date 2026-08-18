@@ -783,7 +783,7 @@ DynLibFunction dynlib_functions[] = {
   { "link", (uintptr_t)&link_stub }, { "symlink", (uintptr_t)&symlink_stub },
   { "readlink", (uintptr_t)&readlink_stub }, { "utime", (uintptr_t)&ret0_i },
   { "utimensat", (uintptr_t)&utimensat_stub }, { "sendfile", (uintptr_t)&sendfile_stub },
-  { "opendir", (uintptr_t)&opendir }, { "closedir", (uintptr_t)&closedir },
+  { "opendir", (uintptr_t)&opendir_fake }, { "closedir", (uintptr_t)&closedir },
   { "readdir", (uintptr_t)&readdir_fake }, { "fdopendir", (uintptr_t)&fdopendir_stub },
   { "realpath", (uintptr_t)&realpath_fake },
   { "strerror", (uintptr_t)&strerror }, { "strerror_r", (uintptr_t)&strerror_r_fake },

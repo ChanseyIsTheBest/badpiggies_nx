@@ -35,6 +35,7 @@
 #include "config.h"
 #include "libc_shim.h"
 #include "bp_unlocks.h"
+#include "nx_fonts.h"
 #include "util.h"
 #include "error.h"
 #include "so_util.h"
@@ -448,7 +449,13 @@ int main(int argc, char *argv[]) {
 
   debugPrintf("[boot] ===== badpiggies_nx build %s %s =====\n", __DATE__, __TIME__);
   debugPrintf("[boot] fixes: ftt-stub gc-offsets asset-redirect touch-hooks 1080p rename-posix "
-              "map-dedup fd-cache(.so-only) synth-proc-cache\n");
+              "map-dedup fd-cache(.so-only) synth-proc-cache cjk-fonts+opendir\n");
+  /* Extract the console's shared fonts and expose them where Unity's dynamic font fallback
+   * looks (/system/fonts + fonts.xml). MUST run before the modules load: libunity reads the
+   * font config while building its fallback list, and an empty list is exactly why the
+   * Simplified Chinese banner text rendered blank while the Latin UI was fine. */
+  nx_fonts_init(GAME_HOME);
+
   debugPrintf("[boot] loading modules...\n");
   if (load_module(&main_mod,   LIB_MAIN)   < 0) fatal_error("Could not load %s", LIB_MAIN);
   if (load_module(&unity_mod,  LIB_UNITY)  < 0) fatal_error("Could not load %s", LIB_UNITY);

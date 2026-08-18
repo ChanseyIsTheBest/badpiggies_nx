@@ -39,6 +39,7 @@
 #include "imports.h"   /* dynlib_find_export (dlsym shim lookup) */
 #include "so_util.h"
 #include "libc_shim.h"
+#include "nx_fonts.h"   /* Switch shared fonts served as /system/fonts (CJK glyphs) */
 #include "android_native_unity.h"
 #include "diag.h"
 
@@ -777,6 +778,7 @@ static int ofdcache_held(int fd) {
 
 int open_fake(const char *path, int flags, ...) {
   nx_stat_open++;
+  path = nx_fonts_resolve(path);   /* Switch system fonts as /system/fonts */
   char _rbuf[512];
   path = casetest_redirect(path);
   path = asset_redirect(path, _rbuf, sizeof _rbuf);
@@ -1022,7 +1024,17 @@ int rename_fake(const char *oldp, const char *newp) {
   return 0;
 }
 
+/* opendir(): the font redirect must cover this too. Android font discovery enumerates
+ * /system/fonts, and BP previously bound "opendir" straight to newlib -- so the Android path
+ * went through unredirected and simply failed. nx_fonts.h is explicit that EVERY filesystem
+ * entry point needs the redirect, not just open(); this was the one I missed. */
+void *opendir_fake(const char *path) {
+  path = nx_fonts_resolve(path);   /* Switch system fonts as /system/fonts */
+  return (void *)opendir(path);
+}
+
 int stat_fake(const char *path, struct bionic_stat *st) {
+  path = nx_fonts_resolve(path);   /* Switch system fonts as /system/fonts */
   char _rbuf[512];
   path = asset_redirect(path, _rbuf, sizeof _rbuf);
   struct stat real; int r = stat(path, &real);
@@ -1884,6 +1896,7 @@ static const char *synthetic_proc(const char *path) {
 // a buffered fopen for the big .mvgl archives: the engine issues many small
 // reads/seeks and the fsdev round-trips dominate without a large buffer.
 FILE *fopen_fake(const char *path, const char *mode) {
+  path = nx_fonts_resolve(path);   /* Switch system fonts as /system/fonts */
   char _rbuf[512];
   path = asset_redirect(path, _rbuf, sizeof _rbuf);
   const char *synth = synthetic_proc(path);
